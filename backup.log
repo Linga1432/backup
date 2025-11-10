@@ -1,0 +1,6 @@
+[Mon, Nov 10, 2025 06:49:35 AM]  Starting backup...
+[Mon, Nov 10, 2025 06:49:35 AM]  No files specified — defaulting to all files in data/
+[Mon, Nov 10, 2025 06:49:36 AM]  Checksum file created: 2025-11-10_06-49-35.sha256
+[Mon, Nov 10, 2025 06:49:36 AM]  Backup process completed successfully.
+[Mon, Nov 10, 2025 06:49:36 AM]  Backup saved at: backups/2025-11-10_06-49-35
+[Mon, Nov 10, 2025 06:49:36 AM]  Log file: backup.log

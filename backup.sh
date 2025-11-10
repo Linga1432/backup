@@ -1,245 +1,209 @@
 #!/bin/bash
+export TZ="Asia/Kolkata"
+ 
+# === Setup Paths ===
+PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BACKUP_ROOT="$PROJECT_DIR/backups"
+BACKUP_TXT="$PROJECT_DIR/backup.txt"
+LOG_FILE="$PROJECT_DIR/backup.log"
+CONFIG_FILE="$PROJECT_DIR/backup.conf"
 
-# Backup Automation System – Full Feature Version
-# Includes: Dry-run, retention (daily/weekly/monthly), restore, list, exclusions, logging, checksum, lockfile, email simulation
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CONFIG_FILE="$SCRIPT_DIR/backup.conf"
-
-# Verify config
-if [[ ! -f "$CONFIG_FILE" ]]; then
-  echo "[ERROR] Config file not found: $CONFIG_FILE"
-  exit 1
+# === Load config file if exists ===
+if [[ -f "$CONFIG_FILE" ]]; then
+  source "$CONFIG_FILE" 
+else
+  BACKUP_DESTINATION="$BACKUP_ROOT"
+  EXCLUDE_PATTERNS=".git node_modules .cache temp"
+  DAILY_KEEP=7
+  WEEKLY_KEEP=4
+  MONTHLY_KEEP=3
 fi
 
-# Load configuration
-source "$CONFIG_FILE"
-
-# Defaults (if any missing from config)
-: "${BACKUP_DIR:="$HOME/backups"}"
-: "${EXCLUDE_PATTERNS:=".git,node_modules,.cache"}"
-: "${DAILY_KEEP:=7}"
-: "${WEEKLY_KEEP:=4}"
-: "${MONTHLY_KEEP:=3}"
-: "${CHECKSUM_ALGO:="sha256"}"
-: "${LOG_FILE:="backup.log"}"
-: "${ALERT_LOG:="alert.log"}"
-: "${NOTIFY_EMAIL:=""}"
-
-mkdir -p "$BACKUP_DIR" || { echo "[ERROR] Cannot create backup dir $BACKUP_DIR"; exit 1; }
-
-LOG_PATH="$BACKUP_DIR/$LOG_FILE"
-ALERT_PATH="$BACKUP_DIR/$ALERT_LOG"
-EMAIL_FILE="$BACKUP_DIR/email.txt"
-
-log() {
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_PATH"
-}
-
-alert() {
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ALERT: $1" | tee -a "$ALERT_PATH"
-}
-
-send_email() {
-  [[ -z "$NOTIFY_EMAIL" ]] && return
-  {
-    echo "To: $NOTIFY_EMAIL"
-    echo "Subject: $1"
-    echo "Date: $(date -R)"
-    echo ""
-    echo "$2"
-    echo "-----"
-  } >> "$EMAIL_FILE"
-}
-
-LOCKFILE="/tmp/backup.lock"
-
-cleanup() {
-  local code=$1
-  if [[ -f "$LOCKFILE" ]]; then
-    owner=$(cat "$LOCKFILE" 2>/dev/null || echo "")
-    [[ "$owner" == "$$" ]] && rm -f "$LOCKFILE"
-  fi
-  exit "$code"
-}
-
-trap 'log "INFO: Interrupted"; cleanup 2' INT TERM
-
-checksum_cmd() {
-  case "$CHECKSUM_ALGO" in
-    sha256)
-      command -v sha256sum >/dev/null && echo "sha256sum" && return
-      command -v shasum >/dev/null && echo "shasum -a 256" && return
-      ;;
-    md5)
-      command -v md5sum >/dev/null && echo "md5sum" && return
-      ;;
-  esac
-  command -v sha256sum >/dev/null && echo "sha256sum" && return
-  command -v md5sum >/dev/null && echo "md5sum" && return
-  command -v shasum >/dev/null && echo "shasum -a 256" && return
-  log "ERROR: No checksum tool available"; cleanup 1
-}
-
-# Parse arguments
-MODE="backup"
-SRC=""
+# === Defaults ===
+COMPRESS=false
+DRY_RUN=false
+RECENT=false
+RECENT_DAYS=1
+KEEP_COUNT=5
+LIST_MODE=false
+RESTORE_MODE=false
 RESTORE_FILE=""
-RESTORE_TO=""
-DRY_RUN=0
+RESTORE_PATH=""
 
+# === Redirect output to backup.txt ===
+exec > >(tee "$BACKUP_TXT") 2>&1
+
+# === Helpers ===
+timestamp() { date +"[%a, %b %e, %Y %I:%M:%S %p]"; }
+log() { echo "$(timestamp) $1" | tee -a "$LOG_FILE"; }
+
+# === Parse Arguments ===
+ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --dry-run) DRY_RUN=1; shift ;;
-    --list) MODE="list"; shift ;;
-    --restore) MODE="restore"; RESTORE_FILE="$2"; shift 2 ;;
-    --to) RESTORE_TO="$2"; shift 2 ;;
-    --help|-h)
-      echo "Usage:"
-      echo "  $0 [--dry-run] /path/to/source"
-      echo "  $0 --list"
-      echo "  $0 --restore backup-file.tar.gz --to /path/restore"
-      exit 0
-      ;;
-    *)
-      SRC="$1"; shift ;;
+    --compress) COMPRESS=true ;;
+    --dry-run) DRY_RUN=true ;;
+    --list) LIST_MODE=true ;;
+    --restore) RESTORE_MODE=true; shift; RESTORE_FILE="$1" ;;
+    --to) shift; RESTORE_PATH="$1" ;;
+    --recent) RECENT=true; shift; RECENT_DAYS=${1//[!0-9]/} ;;
+    --help)
+      echo "Usage: $0 [options] [file1 file2 ...]"
+      echo
+      echo "Options:"
+      echo "  --compress       Compress backup into .tar.gz"
+      echo "  --dry-run        Preview backup actions only"
+      echo "  --recent [Xd]    Backup files modified in last X days"
+      echo "  --list           Show all available backups"
+      echo "  --restore <file> Restore backup to target directory"
+      echo "  --to <path>      Destination for restore"
+      echo "  --help           Show help menu"
+      exit 0 ;;
+    *) ARGS+=("$1") ;;
   esac
+  shift
 done
 
-#####################################
-# LIST MODE
-#####################################
-if [[ "$MODE" == "list" ]]; then
-  echo "Backups in $BACKUP_DIR:"
-  printf "%-35s %-20s %-10s\n" "FILE" "DATE" "SIZE"
-  for f in "$BACKUP_DIR"/backup-*.tar.gz; do
-    [[ ! -f "$f" ]] && continue
-    size=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f")
-    name=$(basename "$f")
-    datepart="${name#backup-}"; datepart="${datepart%.tar.gz}"
-    printf "%-35s %-20s %-10s\n" "$name" "$datepart" "$size"
-  done
+# === List Mode ===
+if [[ "$LIST_MODE" == "true" ]]; then
+  log " Listing available backups in $BACKUP_DESTINATION"
+  echo "--------------------------------------------"
+  ls -lh "$BACKUP_DESTINATION" | awk '{print $6, $7, $8, $9}'
+  echo "--------------------------------------------"
   exit 0
 fi
 
-#####################################
-# RESTORE MODE
-#####################################
-if [[ "$MODE" == "restore" ]]; then
-  [[ -z "$RESTORE_FILE" || -z "$RESTORE_TO" ]] && { echo "Missing --restore or --to"; exit 1; }
-
-  arch="$RESTORE_FILE"
-  [[ ! -f "$arch" && -f "$BACKUP_DIR/$arch" ]] && arch="$BACKUP_DIR/$arch"
-  [[ ! -f "$arch" ]] && { log "ERROR: Restore file not found"; exit 1; }
-
-  mkdir -p "$RESTORE_TO" || { log "ERROR: Cannot create restore dir"; exit 1; }
-
-  if [[ $DRY_RUN -eq 1 ]]; then
-    log "INFO: DRY RUN: Would restore $arch to $RESTORE_TO"
-    exit 0
-  fi
-
-  log "INFO: Restoring $arch to $RESTORE_TO"
-  if tar -xzf "$arch" -C "$RESTORE_TO"; then
-    log "SUCCESS: Restore complete"
-    send_email "Restore successful" "Restored to $RESTORE_TO"
-  else
-    log "ERROR: Restore failed"
-    send_email "Restore failed" "Could not extract $arch"
-  fi
-
-  exit 0
-fi
-
-#####################################
-# BACKUP MODE
-#####################################
-[[ -z "$SRC" ]] && { echo "Error: Source folder missing"; exit 1; }
-[[ ! -d "$SRC" ]] && { alert "Source directory missing: $SRC"; log "ERROR: Source not found"; exit 1; }
-
-# Lock check
-if [[ -f "$LOCKFILE" ]]; then
-  pid=$(cat "$LOCKFILE" 2>/dev/null || echo "")
-  if [[ -n "$pid" ]] && ps -p "$pid" >/dev/null 2>&1; then
-    log "ERROR: Another backup is running (PID $pid)"
+# === Restore Mode ===
+if [[ "$RESTORE_MODE" == "true" ]]; then
+  if [[ -z "$RESTORE_FILE" || -z "$RESTORE_PATH" ]]; then
+    log " Usage: ./backup.sh --restore <file> --to <path>"
     exit 1
   fi
-  rm -f "$LOCKFILE"
-fi
-echo "$$" > "$LOCKFILE"
 
-trap 'cleanup $?' EXIT
+  log " Starting restore process..."
+  log "Source file: $RESTORE_FILE"
+  log "Destination: $RESTORE_PATH"
 
-TIMESTAMP=$(date +"%Y-%m-%d-%H%M")
-ARCHIVE="$BACKUP_DIR/backup-$TIMESTAMP.tar.gz"
-CHECKSUM_FILE="$ARCHIVE.md5"
+  mkdir -p "$RESTORE_PATH"
 
-# Exclusions
-IFS=',' read -ra ex <<< "$EXCLUDE_PATTERNS"
-EXCLUDE_ARGS=()
-for e in "${ex[@]}"; do EXCLUDE_ARGS+=(--exclude="$e"); done
+  if [[ "$RESTORE_FILE" == *.tar.gz ]]; then
+    tar -xzf "$RESTORE_FILE" -C "$RESTORE_PATH"
+  else
+    cp -r "$RESTORE_FILE"/* "$RESTORE_PATH"/
+  fi
 
-if [[ $DRY_RUN -eq 1 ]]; then
-  log "INFO: DRY RUN: Would backup $SRC to $ARCHIVE"
+  log " Restore completed successfully."
   exit 0
 fi
 
-log "INFO: Starting backup of $SRC"
+# === Normal Backup Mode ===
+BACKUP_DIR="$BACKUP_DESTINATION/$(date +"%Y-%m-%d_%H-%M-%S")"
+mkdir -p "$BACKUP_DIR"
 
-if ! tar -czf "$ARCHIVE" "${EXCLUDE_ARGS[@]}" -C "$(dirname "$SRC")" "$(basename "$SRC")"; then
-  alert "Backup failed"
-  log "ERROR: Tar creation failed"
-  cleanup 1
-fi
+log " Starting backup..."
 
-log "SUCCESS: Backup created: $(basename "$ARCHIVE")"
-
-# checksum
-CHKSUM=$(checksum_cmd)
-$CHKSUM "$ARCHIVE" > "$CHECKSUM_FILE"
-log "INFO: Checksum created: $(basename "$CHECKSUM_FILE")"
-
-# verify tar
-if tar -tzf "$ARCHIVE" >/dev/null 2>&1; then
-  log "INFO: Archive integrity OK"
+# === Collect Files ===
+FILES_TO_BACKUP=()
+if [[ "$RECENT" == "true" ]]; then
+  while IFS= read -r -d '' file; do
+    FILES_TO_BACKUP+=("$file")
+  done < <(find "$PROJECT_DIR" -type f -mtime -"$RECENT_DAYS" -print0)
 else
-  alert "Corrupted archive: $ARCHIVE"
-  cleanup 1
+  FILES_TO_BACKUP=("${ARGS[@]}")
 fi
 
-# Retention: daily/weekly/monthly
-log "INFO: Applying retention policy"
-mapfile -t backups < <(ls -1t "$BACKUP_DIR"/backup-*.tar.gz 2>/dev/null || true)
-
-declare -A days weeks months
-d=0; w=0; m=0
-
-for b in "${backups[@]}"; do
-  bn=$(basename "$b")
-  datepart="${bn#backup-}"; datepart="${datepart%.tar.gz}"
-  day="${datepart:0:10}"
-
-  # derive week & month
-  week=$(date -d "$day" +%G-%V 2>/dev/null || echo "$day")
-  month="${day:0:7}"
-
-  keep=0
-  if [[ -z "${days[$day]}" && $d -lt $DAILY_KEEP ]]; then
-    days[$day]=1; d=$((d+1)); keep=1
-  elif [[ -z "${weeks[$week]}" && $w -lt $WEEKLY_KEEP ]]; then
-    weeks[$week]=1; w=$((w+1)); keep=1
-  elif [[ -z "${months[$month]}" && $m -lt $MONTHLY_KEEP ]]; then
-    months[$month]=1; m=$((m+1)); keep=1
-  fi
-
-  if [[ $keep -eq 1 ]]; then
-    log "INFO: Keeping $bn"
+if [[ ${#FILES_TO_BACKUP[@]} -eq 0 ]]; then
+  DEFAULT_DIR="$PROJECT_DIR/data"
+  if [ -d "$DEFAULT_DIR" ]; then
+    log " No files specified — defaulting to all files in data/"
+    FILES_TO_BACKUP=("$DEFAULT_DIR"/*)
   else
-    log "INFO: Deleting $bn"
-    rm -f "$b" "$b.md5"
+    log " No files or data folder found!"
+    exit 1
+  fi
+fi
+
+# === Exclusion Logic ===
+EXCLUDE_ARGS=()
+for pattern in $EXCLUDE_PATTERNS; do
+  EXCLUDE_ARGS+=(--exclude="$pattern")
+done
+
+# === Backup Files ===
+PREVIOUS_BACKUP=$(ls -1dt "$BACKUP_DESTINATION"/*/ 2>/dev/null | head -n 1)
+NEW_FILES=()
+
+for FILE in "${FILES_TO_BACKUP[@]}"; do
+  BASENAME=$(basename "$FILE")
+
+  for pattern in $EXCLUDE_PATTERNS; do
+    if [[ "$FILE" == "$pattern" ]]; then
+      log "  Skipped (excluded): $FILE"
+      continue 2
+    fi
+  done
+
+  if [[ -f "$FILE" ]]; then
+    if [[ "$DRY_RUN" == "true" ]]; then
+      log " Would back up: data/$BASENAME"
+    else
+      cp "$FILE" "$BACKUP_DIR"/
+      log " Backed up: data/$BASENAME"
+    fi
+
+    if [[ -d "$PREVIOUS_BACKUP" && -f "$PREVIOUS_BACKUP/$BASENAME" ]]; then
+      :
+    else
+      NEW_FILES+=("data/$BASENAME")
+    fi
   fi
 done
 
-log "SUCCESS: Backup job completed for $SRC"
-send_email "Backup successful" "Backup completed for $SRC"
-cleanup 0
+# === Newly Added File Summary ===
+if [[ ${#NEW_FILES[@]} -gt 0 ]]; then
+  log "🆕 Newly Added Files:"
+  echo "--------------------------------------------" | tee -a "$LOG_FILE"
+  for NEW_FILE in "${NEW_FILES[@]}"; do
+    echo "$NEW_FILE" | tee -a "$LOG_FILE"
+  done
+  echo "--------------------------------------------" | tee -a "$LOG_FILE"
+fi
+
+# === Compression ===
+if [[ "$COMPRESS" == "true" && "$DRY_RUN" != "true" ]]; then
+  TAR_FILE="$BACKUP_DESTINATION/backup_$(date +"%Y-%m-%d_%H-%M-%S").tar.gz"
+  tar -czf "$TAR_FILE" -C "$BACKUP_DIR" . >/dev/null 2>&1
+  rm -rf "$BACKUP_DIR"
+  BACKUP_OUTPUT="$TAR_FILE"
+  log " Compressed backup created: $(basename "$TAR_FILE")"
+else
+  BACKUP_OUTPUT="$BACKUP_DIR"
+fi
+
+# === Checksum ===
+if [[ "$DRY_RUN" != "true" ]]; then
+  CHECKSUM_FILE="$BACKUP_OUTPUT.sha256"
+  find "$BACKUP_OUTPUT" -type f -exec sha256sum {} \; > "$CHECKSUM_FILE"
+  log " Checksum file created: $(basename "$CHECKSUM_FILE")"
+fi
+
+# === Cleanup Rotation ===
+if [[ "$DRY_RUN" != "true" ]]; then
+  BACKUP_COUNT=$(ls -1t "$BACKUP_DESTINATION" | wc -l)
+  if (( BACKUP_COUNT > KEEP_COUNT )); then
+    OLD_BACKUPS=$(ls -1t "$BACKUP_DESTINATION" | tail -n +$((KEEP_COUNT + 1)))
+    for OLD in $OLD_BACKUPS; do
+      rm -rf "$BACKUP_DESTINATION/$OLD"
+      log " Removed old backup: $OLD"
+    done
+  fi
+fi
+
+# === Completion ===
+if [[ "$DRY_RUN" == "true" ]]; then
+  log " Dry-run completed — no files copied or deleted."
+else
+  log " Backup process completed successfully."
+  log " Backup saved at: backups/$(basename "$BACKUP_OUTPUT")"
+  log " Log file: backup.log"
+fi
